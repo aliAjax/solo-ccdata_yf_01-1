@@ -14,6 +14,70 @@ try {
   process.exit(1);
 }
 
+// ---------- 启动前预检：浏览器二进制 + 系统运行库 ----------
+const LIB_PKG = {
+  'libnspr4.so': 'libnspr4', 'libnss3.so': 'libnss3', 'libnssutil3.so': 'libnss3',
+  'libsmime3.so': 'libnss3', 'libssl3.so': 'libnss3', 'libplc4.so': 'libnspr4',
+  'libplds4.so': 'libnspr4',
+  'libatk-1.0.so.0': 'libatk1.0-0', 'libatk-bridge-2.0.so.0': 'libatk-bridge2.0-0',
+  'libatspi.so.0': 'libatspi2.0-0', 'libdbus-1.so.3': 'libdbus-1-3',
+  'libXcomposite.so.1': 'libxcomposite1', 'libXdamage.so.1': 'libxdamage1',
+  'libXfixes.so.3': 'libxfixes3', 'libXrandr.so.2': 'libxrandr2',
+  'libgbm.so.1': 'libgbm1', 'libxkbcommon.so.0': 'libxkbcommon0',
+  'libasound.so.2': 'libasound2', 'libcups.so.2': 'libcups2',
+  'libpango-1.0.so.0': 'libpango-1.0-0', 'libcairo.so.2': 'libcairo2',
+  'libdrm.so.2': 'libdrm2', 'libwayland-server.so.0': 'libwayland-server0',
+  'libXi.so.6': 'libxi6', 'libXext.so.6': 'libxext6', 'libX11.so.6': 'libx11-6',
+  'libxcb.so.1': 'libxcb1', 'libexpat.so.1': 'libexpat1', 'libglib-2.0.so.0': 'libglib2.0-0',
+  'libxshmfence.so.1': 'libxshmfence1', 'libX11-xcb.so.1': 'libx11-xcb1',
+  'libXcursor.so.1': 'libxcursor1', 'libXss.so.1': 'libxss1', 'libXtst.so.6': 'libxtst6'
+};
+function reportMissingLibs(missing){
+  const pkgs = [...new Set(missing.map(l => LIB_PKG[l]).filter(Boolean))];
+  console.error('✗ 预检失败：Chromium 无法启动，缺少 ' + missing.length + ' 个系统运行库：');
+  for (const l of missing)
+    console.error('  ' + l + (LIB_PKG[l] ? '  →  Debian/Ubuntu 包 ' + LIB_PKG[l] : ''));
+  console.error('\n准备命令（任选其一）：');
+  console.error('  1) npx playwright install --with-deps chromium   # 需 root，自动装系统依赖');
+  if (pkgs.length)
+    console.error('  2) sudo apt-get install -y ' + pkgs.join(' '));
+  console.error('  无 root 环境：下载对应 .deb 解压后，以 LD_LIBRARY_PATH=<解压lib目录> node test-browser.js 运行');
+}
+async function preflight(){
+  // 1) 浏览器二进制是否存在
+  let exe = null;
+  try { exe = chromium.executablePath(); } catch (e) { /* 未安装 */ }
+  if (!exe || !fs.existsSync(exe)){
+    console.error('✗ 预检失败：未找到 Chromium 浏览器二进制。\n\n准备命令：\n  npx playwright install chromium');
+    process.exit(1);
+  }
+  // 2) 启动冒烟测试：以真实启动结果为准（ldd 会把 dlopen 延迟加载的可选库误报为缺失）
+  try {
+    const b = await chromium.launch();
+    await b.close();
+  } catch (e) {
+    const msg = String(e && e.message || e);
+    const missing = [...new Set([...msg.matchAll(/error while loading shared libraries: (\S+?)(?::|$)/gm)].map(m => m[1]))];
+    if (missing.length){
+      reportMissingLibs(missing);
+    } else {
+      console.error('✗ 预检失败：Chromium 启动失败（非典型运行库缺失）。原始错误：\n' + msg.split('\n').slice(0, 12).join('\n'));
+      if (process.platform === 'linux'){
+        // 补充 ldd 诊断（含 dlopen 可选库，仅供参考）
+        const { execSync } = require('child_process');
+        let out = '';
+        try { out = execSync('ldd ' + JSON.stringify(exe) + ' 2>&1').toString(); }
+        catch (e2) { out = (e2.stdout || '').toString(); }
+        const lddMiss = [...new Set([...out.matchAll(/^\s*(\S+)\s*=>\s*not found/gm)].map(m => m[1]))];
+        if (lddMiss.length)
+          console.error('\nldd 报告的未解析库（含可选库，供参考）：\n  ' + lddMiss.join('\n  '));
+      }
+    }
+    process.exit(1);
+  }
+  console.log('预检通过：Chromium 可正常启动 (' + exe + ')');
+}
+
 const ROOT = __dirname;
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.png': 'image/png', '.gif': 'image/gif' };
 const server = http.createServer((req, res) => {
@@ -33,6 +97,7 @@ function ok(cond, name){
 }
 
 (async () => {
+  await preflight(); // 依赖不齐时在此退出并给出准备命令，不齐绝不静默跳过
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const URL = 'http://127.0.0.1:' + server.address().port + '/index.html';
 
@@ -337,4 +402,10 @@ function ok(cond, name){
   await browser.close();
   server.close();
   process.exit(failed ? 1 : 0);
-})().catch(e => { console.error('测试异常:', e); server.close(); process.exit(1); });
+})().catch(e => {
+  console.error('测试异常:', e.message || e);
+  if (/browser.*closed|Target page|SIGTRAP|SIGSEGV|error while loading/i.test(String(e)))
+    console.error('提示：浏览器启动即崩溃通常是系统运行库问题，请查看上方预检输出或运行 `ldd $(npx playwright install chromium --dry-run 2>/dev/null; echo)` 排查。');
+  server.close();
+  process.exit(1);
+});

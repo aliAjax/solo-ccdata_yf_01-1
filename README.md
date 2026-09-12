@@ -46,3 +46,5 @@ npm install                      # 安装 playwright（见 package.json）
 npx playwright install chromium  # 下载浏览器；缺系统库时用 --with-deps（需 root）
 node test-browser.js             # 内置静态服务器，无需手动起服务
 ```
+
+浏览器测试启动前会先做依赖预检：浏览器二进制缺失或系统运行库不足时，直接说明缺失项并给出可执行的准备命令（不会报出晦涩的 "browser process closed"，也不会跳过用例）；预检通过才执行全部 64 项用例。
