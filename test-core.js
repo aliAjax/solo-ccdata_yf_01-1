@@ -303,6 +303,62 @@ ok(match, '64×64 随机图编码→解码逐像素一致');
 const gifNoLoop = C.encodeGIF([f0], 3, 2, [100], false);
 ok(parseGIF(gifNoLoop).loop === undefined, 'loop=false 无循环扩展');
 
+// ---------- 8. 选区 ----------
+console.log('\n[8] 选区');
+s = C.createState(4, 4);
+C.setPixel(s, 1, 1, RED);
+C.setPixel(s, 2, 1, GRN);
+const rect = { x: 1, y: 1, w: 2, h: 2 };
+const buf = C.regionCopy(s, rect);
+eq(buf[0], RED, 'regionCopy 像素(1,1)');
+eq(buf[1], GRN, 'regionCopy 像素(2,1)');
+eq(buf[2], 0, 'regionCopy 空白像素');
+C.regionClear(s, rect);
+eq(C.curCell(s)[1 * 4 + 1], 0, 'regionClear 清除');
+eq(C.curCell(s)[1 * 4 + 2], 0, 'regionClear 清除2');
+// 越界区域：缓冲完整，越界部分为 0
+const buf2 = C.regionCopy(s, { x: 3, y: 3, w: 3, h: 3 });
+eq(buf2.length, 9, '越界 regionCopy 缓冲完整');
+// stamp：跳过透明像素（不覆盖目标），越界裁剪
+C.setPixel(s, 0, 1, BLU); // 目标像素位于 stamp 的透明格
+C.regionStamp(s, { x: 0, y: 0, w: 2, h: 2, data: buf });
+eq(C.curCell(s)[0], RED, 'stamp 写入不透明像素');
+eq(C.curCell(s)[1], GRN, 'stamp 写入第二像素');
+eq(C.curCell(s)[4], BLU, 'stamp 跳过透明像素（保留目标）');
+C.regionStamp(s, { x: 3, y: 3, w: 2, h: 2, data: buf }); // 部分越界
+ok(true, 'stamp 越界裁剪无异常');
+// 跨图层粘贴：合成结果反映新图层内容
+s = C.createState(4, 4);
+C.setPixel(s, 0, 0, RED);
+const clip = C.regionCopy(s, { x: 0, y: 0, w: 1, h: 1 });
+C.addLayer(s);
+C.regionStamp(s, { x: 2, y: 2, w: 1, h: 1, data: clip });
+let comp2 = C.compositeFrame(s, 0);
+eq(comp2[2 * 4 + 2], RED, '跨层粘贴后合成可见');
+eq(comp2[0], RED, '原层像素保留');
+s.layers[1].visible = false;
+comp2 = C.compositeFrame(s, 0);
+eq(comp2[2 * 4 + 2], 0, '隐藏粘贴层后合成不含该像素');
+// 快照/恢复覆盖选区与浮动（撤销重做状态不乱）
+s.layers[1].visible = true;
+s.sel = { x: 1, y: 1, w: 2, h: 2 };
+s.float = { x: 0, y: 0, w: 1, h: 1, data: clip };
+const snapS = C.snapshot(s);
+s.sel = null; s.float = null;
+C.restoreState(s, snapS);
+ok(s.sel && s.sel.w === 2, '快照恢复选区');
+ok(s.float && JSON.stringify(Array.from(s.float.data)) === JSON.stringify(Array.from(clip)), '快照恢复浮动数据');
+ok(s.float && s.float.data !== clip, '快照浮动数据为独立副本');
+// 序列化往返保留选区与浮动（保存刷新不丢）
+const s4 = C.deserializeState(C.serializeState(s));
+ok(s4.sel && s4.sel.h === 2, '序列化恢复选区');
+ok(s4.float && JSON.stringify(Array.from(s4.float.data)) === JSON.stringify(Array.from(clip)), '序列化恢复浮动数据');
+// 损坏的浮动数据容错
+const bad = JSON.parse(C.serializeState(s));
+bad.float.data = '!!!!';
+const s5 = C.deserializeState(JSON.stringify(bad));
+ok(s5 && s5.float === null, '损坏浮动数据容错为空');
+
 // ---------- 汇总 ----------
 console.log(`\n结果：${passed} 通过, ${failed} 失败`);
 process.exit(failed ? 1 : 0);

@@ -164,6 +164,94 @@ function ok(cond, name){
   await page.click('#delLayerBtn');
   ok(await page.locator('.layer').count() === layersBefore - 1, '移除图层');
 
+  console.log('\n[E2] 选区');
+  // 当前：3 帧、1 图层，F1 上有像素 (2,2)(3,2)(5..9,5)
+  await page.keyboard.press('m');
+  ok(await page.locator('.tool[data-tool=select]').getAttribute('class').then(c => c.includes('active')), '按 M 切换选区工具');
+  // 框选 (1,1)-(4,4)
+  let s1 = await px(1, 1), s2 = await px(4, 4);
+  await page.mouse.move(s1.x, s1.y); await page.mouse.down();
+  await page.mouse.move(s2.x, s2.y, { steps: 4 }); await page.mouse.up();
+  ok(await page.locator('#selOverlay').isVisible(), '拖出选区显示选框');
+  // 选区存在时做其他编辑，撤销编辑不应丢选区（选区状态在快照中）
+  await page.keyboard.press('b');
+  await drawPixel(8, 8);
+  await page.keyboard.press('Control+z'); // 撤销这一笔
+  ok(await page.locator('#selOverlay').isVisible(), '撤销绘制不丢选区');
+  await page.keyboard.press('m');
+  // 复制 → 切到第 2 帧 → 粘贴 → Enter 贴下
+  await page.keyboard.press('Control+c');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('Control+v');
+  ok(await page.locator('#selOverlay').isVisible(), '粘贴产生浮动选区');
+  await page.keyboard.press('Enter');
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 255, '跨帧粘贴并贴下');
+  // 撤销/重做覆盖选区操作
+  await page.keyboard.press('Control+z'); // 撤销贴下
+  await page.keyboard.press('Control+z'); // 撤销粘贴
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 0, '撤销粘贴与贴下');
+  await page.keyboard.press('Control+Shift+z');
+  await page.keyboard.press('Control+Shift+z');
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 255, '重做恢复粘贴');
+  // 剪切：回 F1，框选 (2,2) 单像素，Ctrl+X
+  await page.keyboard.press('ArrowLeft');
+  let c1 = await px(2, 2);
+  await page.mouse.click(c1.x, c1.y);
+  await page.keyboard.press('Control+x');
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 0, 'Ctrl+X 剪切移除像素');
+  // 跨图层粘贴：新图层贴下后，隐藏原图层像素仍在
+  await page.click('#addLayerBtn');
+  await page.keyboard.press('Control+v');
+  await page.keyboard.press('Enter');
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 255, '跨图层粘贴后合成可见');
+  await page.locator('.layer').nth(1).locator('button').first().click(); // 隐藏底层（图层 1）
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 255, '隐藏原图层后粘贴内容仍在（跨层一致）');
+  await page.locator('.layer').nth(1).locator('button').first().click(); // 恢复显示
+  // 锁定图层：贴下被阻止，浮动内容不丢失
+  await page.locator('.layer').first().locator('button').nth(1).click(); // 锁定图层 2
+  await page.keyboard.press('Control+v');
+  await page.keyboard.press('Enter');
+  const lockMsg = await page.locator('#status').textContent();
+  ok(lockMsg.includes('锁定') || lockMsg.includes('隐藏'), '锁定图层贴下被阻止: ' + lockMsg);
+  ok(await page.locator('#selOverlay').isVisible(), '浮动内容保留未丢失');
+  await page.locator('.layer').first().locator('button').nth(1).click(); // 解锁
+  await page.keyboard.press('Enter');
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 255, '解锁后可贴下');
+  // 拖动移动：先 Esc 清除旧选区，框选 (1,1)-(3,3)（含 2,2 像素），从内部拖到 (+4,+4)
+  await page.keyboard.press('Escape');
+  ok(!(await page.locator('#selOverlay').isVisible()), 'Esc 取消选区');
+  let m1 = await px(1, 1), m2 = await px(3, 3);
+  await page.mouse.move(m1.x, m1.y); await page.mouse.down();
+  await page.mouse.move(m2.x, m2.y, { steps: 3 }); await page.mouse.up();
+  let mv1 = await px(2, 2), mv2 = await px(6, 6);
+  await page.mouse.move(mv1.x, mv1.y); await page.mouse.down();
+  await page.mouse.move(mv2.x, mv2.y, { steps: 4 }); await page.mouse.up();
+  p = await canvasPixel(6, 6);
+  ok(p[3] === 255, '拖动移动选区内容到目标位置');
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 0, '移动后原位置已清空');
+  await page.keyboard.press('Control+z'); // 撤销移动
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 255, '撤销移动恢复');
+  await page.keyboard.press('Control+z'); // 撤销框选
+  ok(!(await page.locator('#selOverlay').isVisible()), '撤销选区创建（选区变化入历史）');
+  // 保存刷新：跨层粘贴结果保留
+  await page.click('#saveBtn');
+  await page.waitForTimeout(200);
+  await page.reload();
+  await page.waitForTimeout(300);
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 255, '刷新后跨层粘贴内容保留');
+  ok(await page.locator('.layer').count() === 2, '刷新后图层结构保留');
+  await page.keyboard.press('b'); // 回到画笔，供后续用例使用
+
   console.log('\n[F] 播放');
   await page.click('#playBtn');
   await page.waitForTimeout(700);

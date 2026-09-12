@@ -49,6 +49,7 @@ input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent)}
 .stage .grid{position:absolute;inset:0;pointer-events:none;
   background-image:linear-gradient(#ffffff14 1px,transparent 1px),linear-gradient(90deg,#ffffff14 1px,transparent 1px)}
 .stage .grid.off{display:none}
+.stage .sel-overlay{position:absolute;border:1px dashed #fff;outline:1px dashed #000;pointer-events:none;z-index:5}
 .playbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .playbar .field{margin:0}
 .timeline{display:flex;align-items:center;gap:8px}
@@ -112,6 +113,7 @@ dialog td:first-child{text-align:right;white-space:nowrap}
     <aside class="panel left">
       <h3>工具</h3>
       <div class="toolgrid">
+        <button class="tool" data-tool="select" title="选区 (M)">⬚ 选区</button>
         <button class="tool active" data-tool="pencil" title="画笔 (B)">✏️ 画笔</button>
         <button class="tool" data-tool="eraser" title="橡皮 (E)">🧽 橡皮</button>
         <button class="tool" data-tool="fill" title="填充 (G)">🪣 填充</button>
@@ -133,6 +135,7 @@ dialog td:first-child{text-align:right;white-space:nowrap}
           <canvas id="mainCanvas"></canvas>
           <canvas id="onionCanvas" style="opacity:.25;pointer-events:none"></canvas>
           <div class="grid" id="gridOverlay"></div>
+          <div class="sel-overlay" id="selOverlay" style="display:none"></div>
         </div>
       </div>
       <div class="panel playbar">
@@ -193,6 +196,9 @@ dialog td:first-child{text-align:right;white-space:nowrap}
   <h3>键盘快捷键</h3>
   <table>
     <tr><td><span class="kbd">B</span> / <span class="kbd">E</span> / <span class="kbd">G</span> / <span class="kbd">I</span></td><td>画笔 / 橡皮 / 填充 / 取色</td></tr>
+    <tr><td><span class="kbd">M</span></td><td>选区：拖动框选，选区内拖动可移动</td></tr>
+    <tr><td><span class="kbd">Ctrl/⌘ C</span> <span class="kbd">X</span> <span class="kbd">V</span></td><td>复制 / 剪切 / 粘贴选区（可跨帧跨图层）</td></tr>
+    <tr><td><span class="kbd">Enter</span> / <span class="kbd">Esc</span></td><td>贴下浮动内容 / 取消选区</td></tr>
     <tr><td><span class="kbd">Ctrl/⌘ Z</span> · <span class="kbd">Ctrl/⌘ ⇧ Z</span></td><td>撤销 · 重做</td></tr>
     <tr><td><span class="kbd">Ctrl/⌘ S</span></td><td>保存项目</td></tr>
     <tr><td><span class="kbd">空格</span></td><td>播放 / 暂停</td></tr>
@@ -239,7 +245,9 @@ function createState(w, h){
   const state = {
     width: w, height: h, nextId: 1,
     layers: [], frames: [], cells: {},
-    curF: 0, curL: 0
+    curF: 0, curL: 0,
+    sel: null,    // 选区矩形 {x,y,w,h}，画布坐标
+    float: null   // 浮动内容 {x,y,w,h,data}（剪切移动中 / 粘贴待贴下）
   };
   const layer = makeLayer(state, '图层 1');
   state.layers.push(layer);
@@ -347,6 +355,34 @@ function floodFill(state, sx, sy, color){
   }
 }
 
+// ---- 选区 ----
+function regionCopy(state, rect){
+  const cell = curCell(state), w = state.width, h = state.height;
+  const out = new Uint32Array(rect.w * rect.h);
+  for (let y = 0; y < rect.h; y++) for (let x = 0; x < rect.w; x++){
+    const sx = rect.x + x, sy = rect.y + y;
+    if (sx >= 0 && sy >= 0 && sx < w && sy < h) out[y * rect.w + x] = cell[sy * w + sx];
+  }
+  return out;
+}
+function regionClear(state, rect){
+  const cell = curCell(state), w = state.width, h = state.height;
+  for (let y = 0; y < rect.h; y++) for (let x = 0; x < rect.w; x++){
+    const sx = rect.x + x, sy = rect.y + y;
+    if (sx >= 0 && sy >= 0 && sx < w && sy < h) cell[sy * w + sx] = 0;
+  }
+}
+// 贴下浮动内容：只写入不透明像素（透明像素不覆盖目标），越界部分裁剪
+function regionStamp(state, float){
+  const cell = curCell(state), w = state.width, h = state.height;
+  for (let y = 0; y < float.h; y++) for (let x = 0; x < float.w; x++){
+    const dx = float.x + x, dy = float.y + y;
+    if (dx < 0 || dy < 0 || dx >= w || dy >= h) continue;
+    const p = float.data[y * float.w + x];
+    if (p >>> 24) cell[dy * w + dx] = p;
+  }
+}
+
 // ---- 合成（自下而上 src-over）----
 function compositeFrame(state, fi){
   const out = new Uint32Array(state.width * state.height);
@@ -381,7 +417,12 @@ function snapshot(state){
     layers: state.layers.map(l => Object.assign({}, l)),
     frames: state.frames.map(f => Object.assign({}, f)),
     cells: cells,
-    curF: state.curF, curL: state.curL
+    curF: state.curF, curL: state.curL,
+    sel: state.sel ? Object.assign({}, state.sel) : null,
+    float: state.float ? {
+      x: state.float.x, y: state.float.y, w: state.float.w, h: state.float.h,
+      data: state.float.data.slice()
+    } : null
   };
 }
 function restoreState(state, snap){
@@ -392,6 +433,11 @@ function restoreState(state, snap){
   for (const k in snap.cells) state.cells[k] = snap.cells[k].slice();
   state.curF = Math.min(snap.curF, state.frames.length - 1);
   state.curL = Math.min(snap.curL, state.layers.length - 1);
+  state.sel = snap.sel ? Object.assign({}, snap.sel) : null;
+  state.float = (snap.float && snap.float.data) ? {
+    x: snap.float.x, y: snap.float.y, w: snap.float.w, h: snap.float.h,
+    data: snap.float.data.slice()
+  } : null;
 }
 
 // ---- 序列化（localStorage 持久化）----
@@ -415,7 +461,12 @@ function serializeState(state){
     version: 2,
     width: state.width, height: state.height, nextId: state.nextId,
     layers: state.layers, frames: state.frames, cells: cells,
-    curF: state.curF, curL: state.curL
+    curF: state.curF, curL: state.curL,
+    sel: state.sel,
+    float: state.float ? {
+      x: state.float.x, y: state.float.y, w: state.float.w, h: state.float.h,
+      data: u32ToB64(state.float.data)
+    } : null
   });
 }
 function deserializeState(json){
@@ -426,7 +477,8 @@ function deserializeState(json){
     width: d.width, height: d.height, nextId: d.nextId,
     layers: d.layers, frames: d.frames, cells: {},
     curF: Math.min(d.curF || 0, d.frames.length - 1),
-    curL: Math.min(d.curL || 0, d.layers.length - 1)
+    curL: Math.min(d.curL || 0, d.layers.length - 1),
+    sel: null, float: null
   };
   for (const k in d.cells) state.cells[k] = b64ToU32(d.cells[k]);
   // 补齐缺失的 cell（容错）
@@ -434,6 +486,19 @@ function deserializeState(json){
     const k = cellKey(f.id, l.id);
     if (!state.cells[k] || state.cells[k].length !== state.width * state.height)
       state.cells[k] = emptyCell(state);
+  }
+  // 选区 / 浮动内容（容错恢复）
+  const num = v => typeof v === 'number' && isFinite(v);
+  if (d.sel && num(d.sel.x) && num(d.sel.y) && d.sel.w > 0 && d.sel.h > 0 &&
+      d.sel.w <= 4096 && d.sel.h <= 4096)
+    state.sel = { x: d.sel.x | 0, y: d.sel.y | 0, w: d.sel.w | 0, h: d.sel.h | 0 };
+  if (d.float && num(d.float.x) && num(d.float.y) && d.float.w > 0 && d.float.h > 0 &&
+      d.float.w <= 4096 && d.float.h <= 4096 && typeof d.float.data === 'string'){
+    try {
+      const data = b64ToU32(d.float.data);
+      if (data.length === d.float.w * d.float.h)
+        state.float = { x: d.float.x | 0, y: d.float.y | 0, w: d.float.w | 0, h: d.float.h | 0, data: data };
+    } catch (e){ /* 忽略损坏的浮动数据 */ }
   }
   return state;
 }
@@ -551,6 +616,7 @@ const PixelCore = {
   hexToInt, intToCss, intToHex, createState, curFrame, curLayer, curCell, layerEditable,
   addLayer, removeLayer, moveLayer, addFrame, duplicateFrame, deleteFrame, moveFrame,
   setPixel, drawLine, floodFill, compositeFrame,
+  regionCopy, regionClear, regionStamp,
   snapshot, restoreState, serializeState, deserializeState,
   lzwCompress, encodeGIF, cellKey
 };
@@ -572,6 +638,8 @@ let history = [], redoStack = [];
 let playing = false, playTimer = null;
 let drawing = false, lastX = -1, lastY = -1;
 let saveTimer = null;
+let clipboard = null;   // {w,h,data} 选区剪贴板
+let selDrag = null;     // 选区拖动状态 {mode:'create'|'float', ...}
 
 const mainCanvas = $('mainCanvas'), onionCanvas = $('onionCanvas');
 const mctx = mainCanvas.getContext('2d'), octx = onionCanvas.getContext('2d');
@@ -626,7 +694,8 @@ function save(silent){
       settings: {
         color: intToHex(color), tool: tool,
         zoom: +$('zoomRange').value, grid: $('gridChk').checked,
-        onion: $('onionChk').checked, loop: $('loopChk').checked
+        onion: $('onionChk').checked, loop: $('loopChk').checked,
+        clipboard: clipboard ? { w: clipboard.w, h: clipboard.h, data: u32ToB64(clipboard.data) } : null
       }
     };
     localStorage.setItem(STORE_KEY, JSON.stringify(payload));
@@ -654,6 +723,13 @@ function load(){
     $('gridChk').checked = st.grid !== false;
     $('onionChk').checked = !!st.onion;
     $('loopChk').checked = st.loop !== false;
+    if (st.clipboard && typeof st.clipboard.data === 'string'){
+      try {
+        const data = b64ToU32(st.clipboard.data);
+        if (data.length === st.clipboard.w * st.clipboard.h)
+          clipboard = { w: st.clipboard.w, h: st.clipboard.h, data: data };
+      } catch (e){ /* 忽略损坏的剪贴板 */ }
+    }
     return true;
   } catch (e){ return false; }
 }
@@ -678,13 +754,25 @@ function renderStage(){
   const w = state.width, h = state.height;
   if (mainCanvas.width !== w){ mainCanvas.width = w; mainCanvas.height = h; }
   if (onionCanvas.width !== w){ onionCanvas.width = w; onionCanvas.height = h; }
-  paintTo(mctx, compositeFrame(state, state.curF), w, h);
+  const comp = compositeFrame(state, state.curF);
+  // 浮动内容（移动中/待贴下）叠加显示在当前帧上
+  if (state.float){
+    const f = state.float;
+    for (let y = 0; y < f.h; y++) for (let x = 0; x < f.w; x++){
+      const dx = f.x + x, dy = f.y + y;
+      if (dx < 0 || dy < 0 || dx >= w || dy >= h) continue;
+      const p = f.data[y * f.w + x];
+      if (p >>> 24) comp[dy * w + dx] = p;
+    }
+  }
+  paintTo(mctx, comp, w, h);
   octx.clearRect(0, 0, w, h);
   if ($('onionChk').checked && state.frames.length > 1){
     const prev = (state.curF - 1 + state.frames.length) % state.frames.length;
     paintTo(octx, compositeFrame(state, prev), w, h);
   }
   applyZoom();
+  updateSelOverlay();
 }
 function applyZoom(){
   const z = +$('zoomRange').value;
@@ -692,6 +780,18 @@ function applyZoom(){
   stage.style.width = state.width * z + 'px';
   stage.style.height = state.height * z + 'px';
   $('gridOverlay').style.backgroundSize = z + 'px ' + z + 'px';
+  updateSelOverlay();
+}
+function updateSelOverlay(){
+  const ov = $('selOverlay');
+  const s = state && state.sel;
+  if (!s){ ov.style.display = 'none'; return; }
+  const z = +$('zoomRange').value;
+  ov.style.display = 'block';
+  ov.style.left = s.x * z + 'px';
+  ov.style.top = s.y * z + 'px';
+  ov.style.width = s.w * z + 'px';
+  ov.style.height = s.h * z + 'px';
 }
 function renderFrames(){
   const list = $('frameList');
@@ -766,17 +866,145 @@ function guardEditable(){
   }
   return true;
 }
+
+// ---------- 选区 ----------
+function clampPos(p){
+  return { x: Math.max(0, Math.min(state.width - 1, p.x)), y: Math.max(0, Math.min(state.height - 1, p.y)) };
+}
+function inRect(p, r){ return p.x >= r.x && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + r.h; }
+function normRect(x0, y0, x1, y1){
+  return { x: Math.min(x0, x1), y: Math.min(y0, y1), w: Math.abs(x1 - x0) + 1, h: Math.abs(y1 - y0) + 1 };
+}
+function stampFloatIntoCell(){ regionStamp(state, state.float); state.float = null; }
+// 有浮动内容时先贴下（独立一步撤销）；图层不可编辑时拒绝并保持浮动
+function commitStampFloat(){
+  if (!state.float) return true;
+  if (!layerEditable(state)){ status('当前图层已锁定或隐藏，无法贴下浮动内容'); return false; }
+  commit(() => stampFloatIntoCell());
+  status('已贴下');
+  return true;
+}
+function copySelection(){
+  if (state.float) clipboard = { w: state.float.w, h: state.float.h, data: state.float.data.slice() };
+  else if (state.sel) clipboard = { w: state.sel.w, h: state.sel.h, data: regionCopy(state, state.sel) };
+  else { status('没有选区可复制'); return; }
+  status('已复制 ' + clipboard.w + '×' + clipboard.h);
+}
+function cutSelection(){
+  if (state.float){
+    clipboard = { w: state.float.w, h: state.float.h, data: state.float.data.slice() };
+    commit(() => { state.float = null; state.sel = null; });
+    status('已剪切'); return;
+  }
+  if (!state.sel){ status('没有选区可剪切'); return; }
+  if (!guardEditable()) return;
+  clipboard = { w: state.sel.w, h: state.sel.h, data: regionCopy(state, state.sel) };
+  commit(() => regionClear(state, state.sel));
+  status('已剪切');
+}
+function pasteClipboard(){
+  if (!clipboard){ status('剪贴板为空'); return; }
+  if (state.float && !layerEditable(state)){ status('当前图层已锁定或隐藏，无法粘贴'); return; }
+  commit(() => {
+    if (state.float) stampFloatIntoCell();
+    const x = state.sel ? state.sel.x : 0, y = state.sel ? state.sel.y : 0;
+    state.float = { w: clipboard.w, h: clipboard.h, x: x, y: y, data: clipboard.data.slice() };
+    state.sel = { x: x, y: y, w: clipboard.w, h: clipboard.h };
+  });
+  status('已粘贴：可拖动或切换帧/图层，Enter 贴下');
+}
+function deleteSelection(){
+  if (state.float){
+    commit(() => { state.float = null; state.sel = null; });
+    status('已删除浮动内容');
+    return true;
+  }
+  if (state.sel){
+    if (!guardEditable()) return true;
+    commit(() => regionClear(state, state.sel));
+    status('已删除选区内容');
+    return true;
+  }
+  return false;
+}
+function escapeSelection(){
+  if (state.float){ commitStampFloat(); return; } // 浮动内容不丢弃，贴下在当前位置
+  if (state.sel) commit(() => { state.sel = null; });
+}
+function onSelectDown(e, p, raw){
+  // 浮动内容上：直接拖动浮动
+  if (state.float){
+    if (inRect(raw, state.float)){
+      selDrag = { mode: 'float', sx: raw.x, sy: raw.y, ox: state.float.x, oy: state.float.y };
+      drawing = true;
+      try{ mainCanvas.setPointerCapture(e.pointerId); }catch(_){}
+      return;
+    }
+    // 点击浮动区外：先贴下再开始新选区
+    if (!commitStampFloat()) return;
+  }
+  // 选区内：剪切为浮动并拖动移动（整个移动 = 一步撤销）
+  if (state.sel && inRect(p, state.sel)){
+    if (!guardEditable()) return;
+    pushHistory();
+    const r = state.sel;
+    state.float = { x: r.x, y: r.y, w: r.w, h: r.h, data: regionCopy(state, r) };
+    regionClear(state, r);
+    selDrag = { mode: 'float', sx: raw.x, sy: raw.y, ox: r.x, oy: r.y };
+    drawing = true;
+    afterChange();
+    try{ mainCanvas.setPointerCapture(e.pointerId); }catch(_){}
+    return;
+  }
+  // 空白处：新建选区（一次拖动 = 一步撤销）
+  pushHistory();
+  state.sel = { x: p.x, y: p.y, w: 1, h: 1 };
+  selDrag = { mode: 'create', sx: p.x, sy: p.y };
+  drawing = true;
+  afterChange();
+  try{ mainCanvas.setPointerCapture(e.pointerId); }catch(_){}
+}
+function onSelectMove(raw){
+  if (selDrag.mode === 'create'){
+    const p = clampPos(raw);
+    state.sel = normRect(selDrag.sx, selDrag.sy, p.x, p.y);
+  } else {
+    state.float.x = selDrag.ox + (raw.x - selDrag.sx);
+    state.float.y = selDrag.oy + (raw.y - selDrag.sy);
+    state.sel = { x: state.float.x, y: state.float.y, w: state.float.w, h: state.float.h };
+  }
+  renderStage();
+  scheduleSave();
+}
+function onSelectUp(){
+  if (selDrag.mode === 'float' && state.float){
+    // 落点贴下（与剪切同一步撤销，不再入栈）
+    if (layerEditable(state)){
+      const f = state.float;
+      regionStamp(state, f);
+      state.sel = { x: f.x, y: f.y, w: f.w, h: f.h };
+      state.float = null;
+    } else {
+      status('图层已锁定或隐藏，浮动内容保留');
+    }
+  }
+  selDrag = null;
+  afterChange();
+}
 function onPointDown(e){
   e.preventDefault();
-  if (e.button === 2){ const p = canvasPos(e); pickColor(p.x, p.y); return; }
-  const p = canvasPos(e);
-  if (tool === 'picker'){ pickColor(p.x, p.y); return; }
+  const raw = canvasPos(e);
+  if (e.button === 2){ pickColor(raw.x, raw.y); return; }
+  if (tool === 'picker'){ pickColor(raw.x, raw.y); return; }
+  if (tool === 'select'){ onSelectDown(e, clampPos(raw), raw); return; }
   if (!guardEditable()) return;
+  if (!commitStampFloat()) return; // 有浮动内容先贴下
   if (tool === 'fill'){
-    commit(() => floodFill(state, p.x, p.y, color));
+    commit(() => floodFill(state, clampPos(raw).x, clampPos(raw).y, color));
     return;
   }
   // pencil / eraser：一次笔画 = 一步撤销
+  const p = clampPos(raw);
   pushHistory();
   drawing = true;
   lastX = p.x; lastY = p.y;
@@ -786,15 +1014,20 @@ function onPointDown(e){
 }
 function onPointMove(e){
   if (!drawing) return;
-  const p = canvasPos(e);
+  if (selDrag){ onSelectMove(canvasPos(e)); return; }
+  const p = clampPos(canvasPos(e));
   drawLine(state, lastX, lastY, p.x, p.y, tool === 'eraser' ? 0 : color);
   lastX = p.x; lastY = p.y;
   renderStage(); renderFrames(); scheduleSave();
 }
-function onPointUp(){ drawing = false; }
+function onPointUp(){
+  if (selDrag) onSelectUp();
+  drawing = false;
+}
 
 // ---------- 工具 / 颜色 ----------
 function setTool(t){
+  if (state && t !== tool && state.float) commitStampFloat(); // 切换工具前贴下浮动内容
   tool = t;
   document.querySelectorAll('.tool').forEach(b => b.classList.toggle('active', b.dataset.tool === t));
 }
@@ -864,11 +1097,13 @@ function scaledCanvas(pixels, scale){
   return c;
 }
 function exportPng(){
+  if (!commitStampFloat()){ status('请先贴下或处理浮动内容再导出'); return; }
   const c = scaledCanvas(compositeFrame(state, state.curF), 4);
   download('pixel-frame-' + (state.curF + 1) + '.png', c.toDataURL('image/png'));
   status('已导出当前帧 PNG（4x）');
 }
 function exportSheet(){
+  if (!commitStampFloat()){ status('请先贴下或处理浮动内容再导出'); return; }
   const n = state.frames.length, w = state.width, h = state.height;
   const c = document.createElement('canvas');
   c.width = w * n; c.height = h;
@@ -885,6 +1120,7 @@ function exportSheet(){
   status('已导出精灵图（' + n + ' 帧横向排列）');
 }
 function exportGif(){
+  if (!commitStampFloat()){ status('请先贴下或处理浮动内容再导出'); return; }
   const frames = state.frames.map((_, i) => compositeFrame(state, i));
   const delays = state.frames.map(f => f.duration);
   const bytes = encodeGIF(frames, state.width, state.height, delays, $('loopChk').checked);
@@ -897,6 +1133,11 @@ function exportGif(){
 
 // ---------- 事件绑定 ----------
 function bind(){
+  // 按钮点击后移除焦点，避免 Enter/空格 再次触发按钮（与全局快捷键冲突）
+  document.addEventListener('click', e => {
+    const b = e.target && e.target.closest ? e.target.closest('button') : null;
+    if (b) b.blur();
+  });
   mainCanvas.addEventListener('pointerdown', onPointDown);
   mainCanvas.addEventListener('pointermove', onPointMove);
   window.addEventListener('pointerup', onPointUp);
@@ -967,7 +1208,12 @@ function bind(){
       if (e.shiftKey) redo(); else undo();
     } else if (mod && key.toLowerCase() === 'y'){ e.preventDefault(); redo(); }
     else if (mod && key.toLowerCase() === 's'){ e.preventDefault(); save(false); }
+    else if (mod && key.toLowerCase() === 'c'){ if (state.sel || state.float){ e.preventDefault(); copySelection(); } }
+    else if (mod && key.toLowerCase() === 'x'){ if (state.sel || state.float){ e.preventDefault(); cutSelection(); } }
+    else if (mod && key.toLowerCase() === 'v'){ e.preventDefault(); pasteClipboard(); }
     else if (key === ' '){ e.preventDefault(); togglePlay(); }
+    else if (key === 'Enter'){ if (state.float) commitStampFloat(); }
+    else if (key === 'Escape'){ escapeSelection(); }
     else if (key === 'ArrowLeft'){ state.curF = (state.curF - 1 + state.frames.length) % state.frames.length; renderAll(); }
     else if (key === 'ArrowRight'){ state.curF = (state.curF + 1) % state.frames.length; renderAll(); }
     else if (key === 'ArrowUp'){ e.preventDefault(); state.curL = Math.min(state.curL + 1, state.layers.length - 1); renderAll(); }
@@ -976,10 +1222,13 @@ function bind(){
     else if (key === 'e' || key === 'E') setTool('eraser');
     else if (key === 'g' || key === 'G') setTool('fill');
     else if (key === 'i' || key === 'I') setTool('picker');
+    else if (key === 'm' || key === 'M') setTool('select');
     else if (key === 'd' || key === 'D') commit(() => duplicateFrame(state));
-    else if (key === 'Delete'){
-      if (state.frames.length > 1) commit(() => deleteFrame(state));
-      else status('至少保留一帧');
+    else if (key === 'Delete' || key === 'Backspace'){
+      if (!deleteSelection()){
+        if (state.frames.length > 1) commit(() => deleteFrame(state));
+        else status('至少保留一帧');
+      }
     }
     else if (key === '[') commit(() => moveFrame(state, -1));
     else if (key === ']') commit(() => moveFrame(state, +1));
