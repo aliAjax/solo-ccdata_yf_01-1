@@ -27,5 +27,18 @@
 
 ## 验证
 
-- `node test-core.js` — 63 项纯逻辑测试（模型、撤销重做、序列化往返、GIF 字节级解析 + LZW 解码回验）
-- `node test-browser.js` — Playwright 真实浏览器冒烟测试，43 项（绘制、帧/图层操作、播放、保存刷新恢复、导出、窄屏触摸）
+两套测试均在项目根目录运行，不依赖固定工作区路径。
+
+**逻辑测试**（零依赖，直接运行）：
+
+```bash
+node test-core.js   # 67 项：模型、撤销重做、序列化往返、GIF 字节级解析 + LZW 解码回验
+```
+
+**浏览器冒烟测试**（43 项：绘制、帧/图层操作、播放、保存刷新恢复、导出、窄屏触摸）：
+
+```bash
+npm install                      # 安装 playwright（见 package.json）
+npx playwright install chromium  # 下载浏览器；缺系统库时用 --with-deps（需 root）
+node test-browser.js             # 内置静态服务器，无需手动起服务
+```

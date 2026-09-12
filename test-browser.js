@@ -1,8 +1,31 @@
 // Playwright 冒烟测试：真实浏览器验证主要流程
+// 运行：npm install && npx playwright install chromium && node test-browser.js
+// 自包含：内置静态服务器，不依赖外部服务或固定目录。
 'use strict';
-const { chromium } = require('/tmp/pwtest/node_modules/playwright');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
-const URL = 'http://127.0.0.1:8901/index.html';
+let chromium;
+try {
+  ({ chromium } = require('playwright'));
+} catch (e) {
+  console.error('未找到 playwright 依赖，请先运行：\n  npm install\n  npx playwright install chromium');
+  process.exit(1);
+}
+
+const ROOT = __dirname;
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.png': 'image/png', '.gif': 'image/gif' };
+const server = http.createServer((req, res) => {
+  const urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+  const file = path.normalize(path.join(ROOT, urlPath === '/' ? 'index.html' : urlPath));
+  if (!file.startsWith(ROOT) || !fs.existsSync(file) || !fs.statSync(file).isFile()){
+    res.writeHead(404); res.end('not found'); return;
+  }
+  res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+  fs.createReadStream(file).pipe(res);
+});
+
 let passed = 0, failed = 0;
 function ok(cond, name){
   if (cond){ passed++; console.log('  ✓ ' + name); }
@@ -10,11 +33,17 @@ function ok(cond, name){
 }
 
 (async () => {
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  const URL = 'http://127.0.0.1:' + server.address().port + '/index.html';
+
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 }, hasTouch: true });
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
+  // 保证可复现：无论运行环境如何，都从空存储开始（只在首次清空，后续 reload 保留数据）
   await page.goto(URL);
+  await page.evaluate(() => { try { localStorage.clear(); } catch (e){} });
+  await page.reload();
   await page.waitForTimeout(300);
 
   console.log('\n[A] 初始加载');
@@ -23,7 +52,7 @@ function ok(cond, name){
   ok(await page.locator('.layer').count() === 1, '初始 1 图层');
   ok(errors.length === 0, '无 JS 错误: ' + errors.join(';'));
 
-  // 画布中心像素坐标（32x32，默认 zoom=14）；布局会变，每次重新取 boundingBox
+  // 画布像素坐标（32x32，默认 zoom=14）；布局会变，每次重新取 boundingBox
   async function px(x, y){
     const box = await page.locator('#mainCanvas').boundingBox();
     return { x: box.x + (x + 0.5) * box.width / 32, y: box.y + (y + 0.5) * box.height / 32 };
@@ -46,7 +75,7 @@ function ok(cond, name){
   await drawPixel(3, 2);
   let p = await canvasPixel(2, 2);
   ok(p[3] === 255, '点击绘制像素 (alpha=255)');
-  ok(p[0] === 0xb1 && p[1] === 0x3e && p[2] === 0x53, '默认色 #b13e53, 实得 ' + p.slice(0,3).join(','));
+  ok(p[0] === 0xb1 && p[1] === 0x3e && p[2] === 0x53, '默认色 #b13e53, 实得 ' + p.slice(0, 3).join(','));
   // 拖动连续画线
   let a = await px(5, 5), b = await px(9, 5);
   await page.mouse.move(a.x, a.y); await page.mouse.down();
@@ -69,26 +98,37 @@ function ok(cond, name){
   ok(await page.locator('.frame').count() === 2, '新增帧');
   await page.click('#dupFrameBtn');
   ok(await page.locator('.frame').count() === 3, '复制帧');
-  // 复制的是当前帧（空帧），回到第 1 帧复制应带内容
+  // 回到第 1 帧（有内容）并复制
   await page.keyboard.press('ArrowLeft');
   await page.keyboard.press('ArrowLeft');
   await page.click('#dupFrameBtn');
   ok(await page.locator('.frame').count() === 4, '复制第 1 帧');
   p = await canvasPixel(2, 2);
   ok(p[3] === 255, '复制帧携带像素');
-  // 帧排序：当前帧（复制体，索引1）前移
+  // 帧排序：先给当前帧（第 1 帧的复制体，索引 1）设置独特时长作为身份标记，
+  // 前移后必须位于时间轴首位且身份（500ms）跟随——只改选中不交换顺序时必须失败
+  await page.fill('#durInput', '500');
+  await page.dispatchEvent('#durInput', 'change');
+  await page.evaluate(() => document.activeElement && document.activeElement.blur());
   await page.keyboard.press('[');
-  const orderOk = await page.evaluate(() => {
-    // 当前帧应移到索引 0
-    return window !== undefined;
+  const order = await page.evaluate(() => {
+    const frames = [...document.querySelectorAll('.frame')];
+    return {
+      activeIdx: frames.findIndex(f => f.classList.contains('active')),
+      count: frames.length,
+      firstDur: frames[0].querySelector('.dur').textContent
+    };
   });
-  ok(orderOk, '帧前移无错误');
+  ok(order.activeIdx === 0 && order.count === 4 && order.firstDur.includes('500ms'),
+    '帧前移后位于首位且帧身份跟随 (' + order.firstDur + ', activeIdx=' + order.activeIdx + ')');
+  p = await canvasPixel(2, 2);
+  ok(p[3] === 255, '前移后当前帧内容跟随');
   // 逐帧时长
   await page.fill('#durInput', '300');
   await page.dispatchEvent('#durInput', 'change');
   const dur = await page.evaluate(() => document.querySelector('.frame.active .dur').textContent);
   ok(dur.includes('300ms'), '逐帧时长设置: ' + dur);
-  // 删除帧
+  // 删除帧（删除当前帧，即刚设置了 300ms 的复制体）
   const framesBefore = await page.locator('.frame').count();
   await page.click('#delFrameBtn');
   ok(await page.locator('.frame').count() === framesBefore - 1, '删除帧');
@@ -136,6 +176,10 @@ function ok(cond, name){
 
   console.log('\n[G] 保存与刷新恢复');
   await drawPixel(10, 10);
+  // 设置逐帧时长并应用到全部帧，用于验证时长持久化
+  await page.fill('#durInput', '300');
+  await page.dispatchEvent('#durInput', 'change');
+  await page.click('#durAllBtn');
   await page.click('#saveBtn');
   await page.waitForTimeout(200);
   const framesN = await page.locator('.frame').count();
@@ -146,8 +190,9 @@ function ok(cond, name){
   ok(await page.locator('.layer').count() === layersN, '刷新后图层数恢复 (' + layersN + ')');
   p = await canvasPixel(10, 10);
   ok(p[3] === 255, '刷新后像素恢复');
-  const durAfter = await page.evaluate(() => document.querySelector('.frame .dur').textContent);
-  ok(durAfter.includes('300ms') || true, '时长标签存在: ' + durAfter);
+  const durs = await page.$$eval('.frame .dur', els => els.map(e => e.textContent));
+  ok(durs.length === framesN && durs.every(t => t.includes('300ms')),
+    '刷新后逐帧时长恢复: [' + durs.join(' | ') + ']');
 
   console.log('\n[H] 导出');
   const dl1 = page.waitForEvent('download');
@@ -164,7 +209,6 @@ function ok(cond, name){
   ok(d3.suggestedFilename().endsWith('.gif'), '导出 GIF');
   // 校验 GIF 文件内容可被浏览器解码
   const path3 = await d3.path();
-  const fs = require('fs');
   const gifBuf = fs.readFileSync(path3);
   ok(gifBuf.slice(0, 6).toString() === 'GIF89a', 'GIF 文件头正确 (' + gifBuf.length + ' 字节)');
   const gifOk = await page.evaluate(async (b64) => {
@@ -203,5 +247,6 @@ function ok(cond, name){
 
   console.log(`\n浏览器测试结果：${passed} 通过, ${failed} 失败`);
   await browser.close();
+  server.close();
   process.exit(failed ? 1 : 0);
-})().catch(e => { console.error('测试异常:', e); process.exit(1); });
+})().catch(e => { console.error('测试异常:', e); server.close(); process.exit(1); });

@@ -1,9 +1,11 @@
 // Node 逻辑测试：从 index.html 提取脚本，在 vm 中运行纯逻辑层
+// 运行：node test-core.js（零依赖）
 'use strict';
 const fs = require('fs');
+const path = require('path');
 const vm = require('vm');
 
-const html = fs.readFileSync('/workspace/index.html', 'utf8');
+const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const m = html.match(/<script>([\s\S]*)<\/script>/);
 if (!m) { console.error('FAIL: 未找到脚本'); process.exit(1); }
 
@@ -40,16 +42,24 @@ eq(Object.keys(s.cells).length, 3, '每帧每图层一个 cell');
 C.addFrame(s); C.duplicateFrame(s);
 eq(s.frames.length, 3, '帧 新增+复制');
 eq(Object.keys(s.cells).length, 9, '3帧×3层 cells');
-// 复制帧内容独立
+// 复制帧内容独立：改复制体不影响源帧
 C.setPixel(s, 0, 0, RED);
-const dupCell = C.curCell(s);
-C.moveFrame(s, -1); // 移到中间
+const dupId = C.curFrame(s).id;
+// 帧排序：对 frames 数组的实际 id 序列做强校验（排序错误必须失败）
+C.moveFrame(s, -1); // 复制体移到中间
 eq(s.curF, 1, '帧前移后索引');
-ok(C.curCell(s) !== dupCell || true, '占位');
-// 帧排序保持 id 跟随
-const movedId = C.curFrame(s).id;
-C.moveFrame(s, -1);
-eq(C.curFrame(s).id, movedId, '帧移动后 id 跟随');
+const idsBefore = s.frames.map(f => f.id);
+C.moveFrame(s, -1); // 再前移到首位
+eq(s.frames[0].id, dupId, '帧前移后位于首位');
+eq(s.frames.map(f => f.id), [idsBefore[1], idsBefore[0], idsBefore[2]], '帧顺序整体正确');
+C.moveFrame(s, +1); // 后移一位
+eq(s.frames.map(f => f.id), idsBefore, '帧后移顺序正确');
+eq(C.curFrame(s).id, dupId, '帧移动后 id 跟随');
+// 像素独立性：源帧（现位于索引 2）未被复制体的修改影响
+s.curF = 2;
+eq(C.curCell(s)[0], 0, '源帧像素不受复制体修改影响');
+s.curF = 1;
+eq(C.curCell(s)[0], RED, '复制体保留自身修改');
 // 删除帧清理 cells
 const before = Object.keys(s.cells).length;
 C.deleteFrame(s);

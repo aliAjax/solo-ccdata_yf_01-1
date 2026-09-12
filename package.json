@@ -1,0 +1,13 @@
+{
+  "name": "pixel-loom",
+  "version": "1.0.0",
+  "private": true,
+  "description": "无需后端的像素动画编辑器：多图层、逐帧时长、撤销重做、本地保存、PNG/精灵图/GIF 导出",
+  "scripts": {
+    "test": "node test-core.js",
+    "test:browser": "node test-browser.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}
