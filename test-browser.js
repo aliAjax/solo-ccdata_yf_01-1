@@ -91,9 +91,9 @@ const server = http.createServer((req, res) => {
 });
 
 let passed = 0, failed = 0;
-function ok(cond, name){
+function ok(cond, name, detail){
   if (cond){ passed++; console.log('  ✓ ' + name); }
-  else { failed++; console.error('  ✗ ' + name); }
+  else { failed++; console.error('  ✗ ' + name + (detail ? ' —— ' + detail : '')); }
 }
 
 (async () => {
@@ -394,6 +394,126 @@ function ok(cond, name){
     return [r.x + r.width / 2, r.y + r.height / 2];
   })));
   ok(errors.length === 0, '窄屏/触摸无 JS 错误: ' + errors.join(';'));
+
+  console.log('\n[K] 边界');
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.waitForTimeout(200);
+
+  // K1 选区跨缩放：缩放 8 时选框位置/尺寸仍按画布坐标映射
+  await page.evaluate(() => { const z = document.getElementById('zoomRange'); z.value = 8; z.dispatchEvent(new Event('input')); });
+  await page.keyboard.press('m');
+  await page.keyboard.press('Escape');
+  let z1 = await px(3, 3), z2 = await px(6, 6);
+  await page.mouse.move(z1.x, z1.y); await page.mouse.down();
+  await page.mouse.move(z2.x, z2.y, { steps: 4 }); await page.mouse.up();
+  const ov1 = await page.evaluate(() => { const o = document.getElementById('selOverlay'); return { left: o.style.left, top: o.style.top, width: o.style.width, height: o.style.height }; });
+  ok(ov1.left === '24px' && ov1.top === '24px' && ov1.width === '32px' && ov1.height === '32px',
+    '缩放=8 时选框映射正确', '期望 24px/24px/32px/32px 实得 ' + JSON.stringify(ov1));
+  await page.keyboard.press('Escape');
+  await page.evaluate(() => { const z = document.getElementById('zoomRange'); z.value = 14; z.dispatchEvent(new Event('input')); });
+
+  // K2 画布边缘：拖出画布外，选区被钳制在界内
+  let e1 = await px(30, 30);
+  const cbox = await page.locator('#mainCanvas').boundingBox();
+  await page.mouse.move(e1.x, e1.y); await page.mouse.down();
+  await page.mouse.move(cbox.x + cbox.width + 60, cbox.y + cbox.height + 60, { steps: 4 });
+  await page.mouse.up();
+  const ov2 = await page.evaluate(() => { const o = document.getElementById('selOverlay'); return { left: o.style.left, width: o.style.width }; });
+  ok(ov2.left === (30 * 14) + 'px' && ov2.width === (2 * 14) + 'px',
+    '拖出画布边缘选区被钳制', '期望 left=420px width=28px 实得 ' + JSON.stringify(ov2));
+  await page.keyboard.press('Escape');
+
+  // K3 透明区域覆盖：移动含透明孔的选区，目标处已有像素不被透明覆盖
+  await page.keyboard.press('b');
+  await page.locator('.sw').nth(3).click();   // #b13e53
+  await drawPixel(21, 21);                     // 目标像素（应保留）
+  await page.locator('.sw').nth(5).click();   // #ffcd75
+  await drawPixel(10, 10);                     // 源像素
+  await page.keyboard.press('m');
+  let t1 = await px(10, 10), t2 = await px(11, 11); // 2x2 选区，仅 (10,10) 有像素
+  await page.mouse.move(t1.x, t1.y); await page.mouse.down();
+  await page.mouse.move(t2.x, t2.y, { steps: 3 }); await page.mouse.up();
+  let t3 = await px(10, 10), t4 = await px(20, 20); // 从选区内拖到 (+10,+10)
+  await page.mouse.move(t3.x, t3.y); await page.mouse.down();
+  await page.mouse.move(t4.x, t4.y, { steps: 4 }); await page.mouse.up();
+  p = await canvasPixel(20, 20);
+  ok(p[0] === 0xff && p[1] === 0xcd, '移动后源像素落在目标', '期望 #ffcd75 实得 ' + p.join(','));
+  p = await canvasPixel(21, 21);
+  ok(p[0] === 0xb1 && p[1] === 0x3e, '透明孔不覆盖目标已有像素', '期望 #b13e53 实得 ' + p.join(','));
+  await page.keyboard.press('Escape');
+
+  // K4 导出时浮动内容：未贴下直接导出，导出图应包含浮动像素
+  await page.keyboard.press('b');
+  await drawPixel(15, 15);
+  await page.keyboard.press('m');
+  let f1 = await px(15, 15);
+  await page.mouse.click(f1.x, f1.y);          // 1x1 选区
+  await page.keyboard.press('Control+c');
+  await page.keyboard.press('Control+v');      // 浮动，未贴下
+  const dlF = page.waitForEvent('download');
+  await page.click('#exportPngBtn');
+  const dF = await dlF;
+  const pngBuf = fs.readFileSync(await dF.path());
+  const floatExported = await page.evaluate(async (b64) => {
+    const img = new Image();
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = 'data:image/png;base64,' + b64; });
+    const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+    const x = c.getContext('2d'); x.drawImage(img, 0, 0);
+    const d = x.getImageData(60, 60, 1, 1).data; // 4x 导出 → (15*4, 15*4)
+    return d[3] === 255 && d[0] === 0xff && d[1] === 0xcd;
+  }, pngBuf.toString('base64'));
+  ok(floatExported, '导出 PNG 包含未贴下的浮动内容（导出前自动贴下）', '期望 (60,60)=#ffcd75 不透明');
+  p = await canvasPixel(15, 15);
+  ok(p[3] === 255, '导出后浮动内容已贴下到画布');
+  await page.keyboard.press('Escape');
+
+  // K5 重做失效：撤销后做新编辑，重做必须清空
+  await page.keyboard.press('b');
+  await drawPixel(25, 25);
+  await page.keyboard.press('Control+z');
+  const redoAfterUndo = await page.locator('#redoBtn').isDisabled();
+  ok(!redoAfterUndo, '撤销后可重做', '期望重做按钮可用');
+  await drawPixel(26, 26); // 新编辑 → 重做栈失效
+  ok(await page.locator('#redoBtn').isDisabled(), '新编辑后重做失效', '期望重做按钮禁用');
+
+  // K6 损坏本地数据（写入前屏蔽 setItem，防止 beforeunload 自动保存把损坏数据覆盖回去）
+  const errsK = errors.length;
+  await page.evaluate(() => {
+    const orig = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = (k, v) => { if (k !== 'pixelloom.project.v2') orig(k, v); };
+    orig('pixelloom.project.v2', '垃圾数据{{{');
+  });
+  await page.reload(); await page.waitForTimeout(300);
+  ok(await page.locator('.frame').count() === 1, '垃圾数据回退到新建项目', '期望 1 帧');
+  ok(errors.length === errsK, '垃圾数据无 JS 错误', errors.slice(errsK).join(';'));
+  // 结构合法但 cells 缺失 → 容错加载（帧结构保留，cell 补空）
+  await page.evaluate(() => {
+    const orig = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = (k, v) => { if (k !== 'pixelloom.project.v2') orig(k, v); };
+    orig('pixelloom.project.v2', JSON.stringify({ state: JSON.stringify({ version: 2, width: 32, height: 32, nextId: 4,
+      layers: [{ id: 1, name: '图层 1', visible: true, locked: false }],
+      frames: [{ id: 2, duration: 100 }, { id: 3, duration: 200 }],
+      cells: {}, curF: 0, curL: 0 }), settings: {} }));
+  });
+  await page.reload(); await page.waitForTimeout(300);
+  ok(await page.locator('.frame').count() === 2, '缺失 cells 容错加载（帧结构保留）', '期望 2 帧');
+  ok(errors.length === errsK, '容错加载无 JS 错误', errors.slice(errsK).join(';'));
+
+  // K7 撤销历史上限：105 次复制帧后只能撤销 100 步
+  const framesStart = await page.locator('.frame').count();
+  for (let i = 0; i < 105; i++) await page.keyboard.press('d');
+  ok(await page.locator('.frame').count() === framesStart + 105, '连续 105 次复制帧',
+    '期望 ' + (framesStart + 105) + ' 帧');
+  let undos = 0;
+  for (let i = 0; i < 110; i++){
+    if (await page.locator('#undoBtn').isDisabled()) break;
+    await page.keyboard.press('Control+z');
+    undos++;
+  }
+  ok(undos === 100, '撤销历史上限 100 步', '期望可撤销 100 次 实得 ' + undos);
+  ok(await page.locator('#undoBtn').isDisabled(), '达到上限后撤销按钮禁用');
+  ok(await page.locator('.frame').count() === framesStart + 5, '上限后保留最近 100 步状态',
+    '期望 ' + (framesStart + 5) + ' 帧 实得 ' + await page.locator('.frame').count());
 
   console.log('\n[J] 全程无页面错误');
   ok(errors.length === 0, errors.join(';') || '无 pageerror');

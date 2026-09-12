@@ -359,6 +359,31 @@ bad.float.data = '!!!!';
 const s5 = C.deserializeState(JSON.stringify(bad));
 ok(s5 && s5.float === null, '损坏浮动数据容错为空');
 
+// ---------- 9. 边界（纯逻辑） ----------
+console.log('\n[9] 边界（纯逻辑）');
+s = C.createState(4, 4);
+// 完全越界的拷贝 → 全 0
+const ob = C.regionCopy(s, { x: 10, y: 10, w: 2, h: 2 });
+ok(ob.every(v => v === 0), '完全越界 regionCopy 返回全 0');
+// 负坐标 stamp：只写界内部分
+C.regionStamp(s, { x: -1, y: -1, w: 2, h: 2, data: new Uint32Array([RED, RED, RED, RED]) });
+eq(C.curCell(s)[0], RED, '负坐标 stamp 写入界内部分');
+eq(C.curCell(s)[1], 0, '负坐标 stamp 界外不影响');
+// 完全越界 stamp → 无操作
+C.regionStamp(s, { x: 10, y: 10, w: 2, h: 2, data: new Uint32Array([RED, RED, RED, RED]) });
+eq(C.curCell(s)[0], RED, '完全越界 stamp 无操作');
+// 越界填充不异常；跨界连线只画界内
+C.floodFill(s, -1, -1, GRN);
+ok(true, '越界 floodFill 无异常');
+C.drawLine(s, -5, -5, 3, 3, GRN);
+eq(C.curCell(s)[15], GRN, 'drawLine 跨界只画界内');
+// 帧/图层移动边界
+ok(C.moveFrame(s, -1) === false, '首帧前移返回 false');
+s.curL = 0;
+ok(C.moveLayer(s, -1) === false, '底层下移返回 false');
+s.curL = s.layers.length - 1;
+ok(C.moveLayer(s, +1) === false, '顶层上移返回 false');
+
 // ---------- 汇总 ----------
 console.log(`\n结果：${passed} 通过, ${failed} 失败`);
 process.exit(failed ? 1 : 0);
